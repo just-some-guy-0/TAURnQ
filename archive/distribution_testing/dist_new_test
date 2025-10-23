@@ -1,0 +1,30 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Chilton log-normal analogue (in s-space)
+def rho_chilton_s(s, alpha):
+    g = 1.82 * np.sqrt(alpha) / (1 - alpha)
+    return np.exp(-0.5*(s/g)**2) / (g*np.sqrt(2*np.pi))
+
+# Arbitrary log-normal in s-space (Gaussian with mean mu_test, std sigma_test)
+def rho_test_s(s, mu, sigma):
+    return np.exp(-0.5*((s-mu)/sigma)**2) / (sigma*np.sqrt(2*np.pi))
+
+# Parameters
+alpha = 0.2
+mu_test = 0.0     # try shifting mean
+sigma_test = 1 # arbitrary test std dev
+
+s = np.linspace(-5, 5, 2001)
+chilton = rho_chilton_s(s, alpha)
+test = rho_test_s(s, mu_test, sigma_test)
+
+# Plot
+plt.figure(figsize=(7,5))
+plt.plot(s, chilton, label="Chilton log-normal analogue")
+plt.plot(s, test, "--", label=f"Arbitrary log-normal μ={mu_test}, σ={sigma_test}")
+plt.xlabel("s = ln(τ/τm)")
+plt.ylabel("ρ(s)")
+plt.title(f"Comparison at α={alpha}")
+plt.legend()
+plt.show()
