@@ -1,34 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Step 2 — Stagewise Linear Regressions for Parameter Means & SDs
-===============================================================
-Reads a TSV/CSV with columns: T (K), tau_mu, alpha.
-
-Goal: In windows where each term dominates, use linear relations between
-the distribution of ln(tau) and the parameter means/variances to estimate
-both the parameter MEANS and SDs (and, where identifiable, their correlations).
-
-Windows (override via CLI):
-  - Orbach:   T >= --orbmin       (default 40 K)
-  - Raman:    --ramlo <= T < --orbmin   (default 25..40 K)
-  - QTM:      T < --qtmmax        (default 25 K)
-
-Key relations (natural logs unless stated; ln10 = ln(10)):
-  Orbach-dominant:
-    ln(tau) = ln10 * A + U / T
-    Var[ln(tau)] = (ln10)^2 sigma_A^2 + (sigma_U^2)/T^2 + 2 (ln10/T) rho_AU sigma_A sigma_U
-
-  Raman-dominant (rate_R = 10^R T^n, so ln tau = -ln rate_R):
-    ln(tau) = -ln10 * R - n * ln T
-    Var[ln(tau)] = (ln10)^2 sigma_R^2 + (ln T)^2 sigma_n^2 + 2 (ln10)(ln T) Cov(R,n)
-
-  QTM-dominant (rate_Q = 10^{-Q}, so ln tau = ln10 * Q):
-    ln(tau) = ln10 * Q              (constant in T)
-    Var[ln(tau)] = (ln10)^2 sigma_Q^2  (constant in T)
-
-Outputs: a CSV of stagewise estimates for means, SDs, and correlations.
-"""
 import argparse
 import numpy as np
 import pandas as pd
@@ -41,12 +10,10 @@ def g_from_alpha(alpha):
     return 1.82*np.sqrt(alpha)/(1 - alpha)  # natural-log std
 
 def fit_linear(y, X):
-    """Least-squares fit y ~ X @ beta, returns beta (no intercept added)."""
     beta, *_ = np.linalg.lstsq(X, y, rcond=None)
     return beta
 
 def stage_orbach(T, tau_mu, g):
-    """Estimate mu_A, mu_U, sigma_A, sigma_U, rho_AU in an Orbach-dominant window."""
     # Means: ln tau = LN10 * mu_A + mu_U / T
     y = np.log(tau_mu)
     X_mean = np.column_stack([np.ones_like(T), 1.0/T])
@@ -70,7 +37,6 @@ def stage_orbach(T, tau_mu, g):
     return mu_A, mu_U, sigma_A, sigma_U, rho
 
 def stage_raman(T, tau_mu, g):
-    """Estimate mu_R, mu_n, sigma_R, sigma_n, rho_Rn in a Raman-dominant window."""
     # Means: ln tau = -LN10*R - n*ln T
     y = np.log(tau_mu)
     x = np.log(T)
@@ -95,7 +61,6 @@ def stage_raman(T, tau_mu, g):
     return mu_R, mu_n, sigma_R, sigma_n, rho
 
 def stage_qtm(T, tau_mu, g):
-    """Estimate mu_Q, sigma_Q in a QTM-dominant window (ln tau ~ constant)."""
     y = np.log(tau_mu)
     mu_Q = float(np.mean(y) / LN10)         # ln tau = LN10 * Q -> Q = ln tau / LN10
     sigma_Q = float(np.mean(g) / LN10)      # Var(ln tau) ~ const -> sigma_Q = g/LN10

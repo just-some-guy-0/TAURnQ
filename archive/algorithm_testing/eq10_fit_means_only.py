@@ -1,21 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Step 1 — Fit Eq. 10 to the MEAN relaxation times to obtain INITIAL GUESSES
-==========================================================================
-Input  : TSV/CSV with columns [T (K), tau_mu, alpha]. (alpha not used here)
-Output : Prints fitted parameters (A, Ueff, R, n, Q) and R^2 to console,
-         saves a CSV with the same, and optionally a plot.
-
-Equation 10 (rate form):
-    rate(T) = tau^{-1}(T) = 10^{-A} * exp(-Ueff/T) + 10^{R} * T^{n} + 10^{-Q}
-
-We fit in log10-space to stabilise the dynamic range:
-    y(T) = log10(rate_model(T; A,Ueff,R,n,Q))
-
-The aim of THIS script is ONLY to produce sensible initial guesses from the
-means (tau_mu). No widths/alphas are used yet.
-"""
 import argparse
 import numpy as np
 import pandas as pd
@@ -38,12 +20,6 @@ def log10_rate_model(T, A, Ueff, R, n, Q):
 
 # --------------------- Heuristic initial guesses ---------------------
 def guess_params_from_means(T, tau_mu, orbmin=40.0, qtmmax=20.0):
-    """
-    Build crude but robust starting values from the means only.
-    - Orbach: linear fit of y = -log10(tau_mu) vs 1/T over high-T (T >= orbmin)
-    - QTM   : Q ≈ -median(log10(rate)) over low-T (T <= qtmmax), else 0
-    - Raman : after subtracting current Orbach+QTM, fit log10(residual) vs log10(T)
-    """
     rate_obs = 1.0 / tau_mu
     y_all    = np.log10(rate_obs)
 
@@ -57,7 +33,7 @@ def guess_params_from_means(T, tau_mu, orbmin=40.0, qtmmax=20.0):
         A0 = -c0
         U0 = -c1 * LN10
     else:
-        # fallbacks
+        # fallbacks (rarely reached)
         A0 = -10.0
         U0 = 800.0
 
@@ -116,7 +92,7 @@ def main():
     A0, U0, R0, n0, Q0 = guess_params_from_means(T, tau_mu, orbmin=args.orbmin, qtmmax=args.qtmmax)
     init = np.array([A0, U0, R0, n0, Q0], dtype=float)
 
-    # Bounds (broad, physically sensible)
+    # Bounds (physical)
     bounds_lo = np.array([-20.0,    0.0, -40.0, 2.0,  -5.0], dtype=float)
     bounds_hi = np.array([   5.0, 5000.0,  10.0,12.0, 15.0], dtype=float)
 
@@ -132,7 +108,6 @@ def main():
     RMSE  = float(np.sqrt(np.mean((y_fit - y_obs)**2)))
     R2    = float(r2_score(y_obs, y_fit))
 
-    # Report
     print("Initial guesses (heuristics from means):")
     print(f"  A0={A0:.4f}, U0={U0:.1f} K, R0={R0:.4f}, n0={n0:.3f}, Q0={Q0:.4f}")
     print("\nEq.10 fit to MEANS (use these as initial guesses for later stages):")
@@ -142,15 +117,7 @@ def main():
     print(f"  n   = {n:.3f}")
     print(f"  Q   = {Q:.4f}")
     print(f"  RMSE(log10 rate) = {RMSE:.3f},   R^2 = {R2:.4f}")
-
-    # Save CSV
-    out = pd.DataFrame({
-        "param": ["A","Ueff_K","R","n","Q","RMSE_log10rate","R2"],
-        "value": [A, Ueff, R, n, Q, RMSE, R2]
-    })
-    out.to_csv(args.outfile, index=False)
-    print(f"\nSaved initial-guess parameters to: {os.path.abspath(args.outfile)}")    
-
+    
     # Plot
     order = np.argsort(T)
     T_sorted = T[order]

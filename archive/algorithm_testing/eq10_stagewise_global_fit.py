@@ -1,24 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Stagewise and Global Fit of Eq.10 (Reta-Chilton style)
------------------------------------------------------
-Reads a TSV/CSV with columns: T(K), tau_mu, alpha.
-Performs:
-  1) Stagewise fitting to get initial guesses:
-     - Orbach: linear fit of -log10(tau_mu) vs 1/T on high-T band
-     - Raman: nonlinear fit with Orbach fixed on mid-T band (QTM negligible)
-     - QTM:   nonlinear fit with Orbach+Raman fixed on low-T band
-  2) Global nonlinear least squares fit of Eq.10 over all data
-  3) Outputs parameter estimates with 1sigma (linearised covariance),
-     plots data with +-1sigma error bars (from alpha) and fitted curve,
-     and writes a CSV of fitted parameters.
-
-Usage:
-  python eq10_stagewise_global_fit.py --infile tBuOCl.tsv --outfile params.csv --plot out.png
-
-Author: ChatGPT (generated)
-"""
 import argparse
 import numpy as np
 import pandas as pd
@@ -29,12 +8,10 @@ import os
 LN10 = np.log(10.0)
 
 def g_from_alpha(alpha):
-    """Natural-log standard deviation for the log-normal analogue (Reta-Chilton)."""
     alpha = np.clip(alpha, 1e-12, 0.999999)
     return 1.82*np.sqrt(alpha)/(1 - alpha)
 
 def rate_model(T, A, Ueff, R, n, Q):
-    """Eq. 10 total relaxation rate (in linear space)."""
     term_orb = (10.0**(-A)) * np.exp(-Ueff / T)  # Orbach
     term_ram = (10.0**(R))  * (T**n)             # Raman
     term_qtm = (10.0**(-Q))                      # QTM
@@ -44,7 +21,6 @@ def log10_rate_model(T, A, Ueff, R, n, Q):
     return np.log10(np.clip(rate_model(T, A, Ueff, R, n, Q), 1e-300, None))
 
 def linearised_param_sd(ls_result):
-    """Return (sd, cov, rss, s2) from linearised covariance (J^T J)^-1, with small ridge."""
     J = ls_result.jac
     N, P = J.shape
     rss = float(np.sum(ls_result.fun**2))
@@ -64,7 +40,6 @@ def r2_score(y_true, y_pred):
 
 def stagewise_and_global_fit(T, tau_mu, alpha, T_orb_min=40.0, T_ram_lo=25.0, T_qtm_max=25.0,
                              weighted=False):
-    """Run the stagewise initialisation and global fit."""
     # Observables
     rate_obs = 1.0 / tau_mu
     log10_rate_obs = np.log10(rate_obs)

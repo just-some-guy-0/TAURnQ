@@ -1,21 +1,4 @@
 #!/usr/bin/env python3
-"""
-Monte Carlo distribution of Γ(T) at a single temperature for the model:
-
-    Γ(T) = 10^(-A) * exp(-Ueff / T) + 10^(R) * T^n + 10^(Q)
-
-You can pass parameter means/SDs, temperature, and sample size on the CLI:
-    python mc_gamma_at_T.py \
-        --means 10.6,850,-5.3,4,-0.35 \
-        --sds   0.2,50,0.3,0.4,0.2 \
-        --T 40 \
-        --N 50000 \
-        --seed 42 \
-        --out-prefix gamma_T40
-
-This will also save figures if --out-prefix is provided.
-"""
-
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
@@ -109,19 +92,6 @@ def main():
     print(f"\nT* = {T_star} K, N = {args.N}")
     print_table(stats_lin, title="Γ(T*) summary (linear space, s^-1)")
     print_table(stats_log, title="log10 Γ(T*) summary")
-
-    # --- Plots ---
-    # # Linear-scale histogram
-    # plt.figure(figsize=(7, 4.5))
-    # plt.hist(gamma, bins=80, density=True)
-    # plt.xlabel(r"$\Gamma(T^*)\ \mathrm{[s^{-1}]}$")
-    # plt.ylabel("Density")
-    # plt.title(f"Distribution of Γ at T = {T_star} K (linear scale)")
-    # plt.tight_layout()
-    # if args.out_prefix:
-    #     Path(".").mkdir(exist_ok=True, parents=True)
-    #     plt.savefig(f"{args.out_prefix}_linear_hist.png", dpi=200)
-    # plt.show()
 
     # Log10 histogram
     plt.figure(figsize=(7, 4.5))

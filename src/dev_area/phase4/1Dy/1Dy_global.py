@@ -275,7 +275,7 @@ def main():
     ap.add_argument("--use_regime_sds", action="store_true",
                     help="Overwrite initial SDs (sA,sU,sR,sN,sQ) with regime seeds.")
     ap.add_argument("--regime_means",
-                    default="-11.093491,900.572427,-4.831255,3.963503,-0.182074",
+                    default=None,
                     help="Regime mean seeds A,Ueff,R,N,Q (CSV or JSON).")
     ap.add_argument("--regime_sds",
                     default="0.224577,14.365442,2.171177,1.392262,0.565583",
