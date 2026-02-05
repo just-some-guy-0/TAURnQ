@@ -17,7 +17,7 @@ def fk_ln_quantiles(tau_mean, alpha, qs):
 def rate_model(T, A, Ueff, R, N, Q):
     T_safe = np.maximum(T, 1e-300)
     term1 = 10.0**(-A) * np.exp(-Ueff / np.maximum(T_safe, 1e-12))  # Orbach
-    term2 = 10.0**(R)  * (T_safe**N)                              # Raman
+    term2 = 10.0**(R)  * (T_safe**N)                               # Raman
     term3 = 10.0**(-Q)                                             # QTM
     return term1 + term2 + term3
 

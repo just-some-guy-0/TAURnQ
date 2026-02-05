@@ -47,11 +47,23 @@ def draw_params_correlated(mu, sigmas, rho_AU, rho_RN, Z):
     return np.column_stack([A_s, U_s, R_s, N_s, Q_s])
 
 def simulate_ln_tau_quantiles(T, mu, sigmas, rho_AU, rho_RN, qs, Z):
-    theta = draw_params_correlated(mu, sigmas, rho_AU, rho_RN, Z)
-    A_s, U_s, R_s, N_s, Q_s = theta.T
-    r = rate_model(T, A_s, U_s, R_s, N_s, Q_s)
-    tau = 1.0/np.maximum(r, 1e-300)
-    ln_tau = np.log(tau)
+    A, U, R, n, Q       = mu
+    sA, sU, sR, sN, sQ  = sigmas
+
+    # Inline 2x2 Cholesky application — avoids L allocs, matmul, and column_stack
+    sqrt_AU = np.sqrt(max(1.0 - rho_AU**2, 1e-12))
+    sqrt_RN = np.sqrt(max(1.0 - rho_RN**2, 1e-12))
+    z0, z1, z2, z3, z4 = Z[:, 0], Z[:, 1], Z[:, 2], Z[:, 3], Z[:, 4]
+
+    A_s = A + sA * z0
+    U_s = U + sU * (rho_AU * z0 + sqrt_AU * z1)
+    R_s = R + sR * z2
+    N_s = n + sN * (rho_RN * z2 + sqrt_RN * z3)
+    Q_s = Q + sQ * z4
+
+    # Inline rate_model — T is a positive scalar, no clipping needed
+    r = 10.0**(-A_s) * np.exp(-U_s / T) + 10.0**(R_s) * (T**N_s) + 10.0**(-Q_s)
+    ln_tau = -np.log(np.maximum(r, 1e-300))
     return np.quantile(ln_tau, qs)
 
 def fit_one_row(df, idx, out_path, seed_base=12345, make_plot=False):
@@ -64,13 +76,14 @@ def fit_one_row(df, idx, out_path, seed_base=12345, make_plot=False):
     qs = np.array([0.02, 0.10, 0.25, 0.50, 0.75, 0.90, 0.98], dtype=float)
     target_lnq = fk_ln_quantiles(tau_m, alpha, qs)
 
-    # initial guesses (tune if you like)
-    A    = -11.160788
-    Ueff =   908.817531
-    R    = -5.284610
-    N    = 4.260671
-    Q    = -0.165256
-    sA, sUeff, sR, sN, sQ = 0.200007, 17.376382, 2.470543, 1.593663, 0.580584
+    # initial guesses from phase2 fits
+    p = pd.read_csv("tBuOCl_params.csv").set_index("param")["value"].to_dict()
+    A    = p["mu_A"]
+    Ueff = p["mu_U"]
+    R    = p["mu_R"]
+    N    = p["mu_N"]
+    Q    = p["mu_q"]
+    sA, sUeff, sR, sN, sQ = p["sd_A"], p["sd_U"], p["sd_R"], p["sd_N"], p["sd_q"]
 
     # corr params
     eta_AU = 0.9
@@ -81,7 +94,7 @@ def fit_one_row(df, idx, out_path, seed_base=12345, make_plot=False):
                    eta_AU, eta_RN], dtype=float)
 
     # common random numbers (idx-specific seed avoids coupling across rows)
-    K = 25000
+    K = 5000
     rng = np.random.default_rng(int(seed_base) + int(idx))
     random_draws = rng.standard_normal(size=(K,5))
 

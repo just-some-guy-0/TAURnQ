@@ -3,6 +3,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
+import os
 
 LN10 = np.log(10)
 tmin = 30
@@ -13,7 +14,7 @@ def g_from_alpha(alpha):
     return 1.82*np.sqrt(alpha)/(1 - alpha) 
 
 def load_tsv(path, tmin, tmax):
-    df = pd.read_csv(path, delim_whitespace=True, header=None)
+    df = pd.read_csv(path, sep=r'\s+', header=None)
     df = df.iloc[:, :3]
     df.columns = ["T", "tau_mu", "alpha"]
     return df[(df["T"] >= tmin) & (df["T"] <= tmax)].reset_index(drop=True)
@@ -92,6 +93,10 @@ if __name__ == "__main__":
     print(f"Fitted parameters (Raman-only, {tmin}-{tmax} K):")
     for k, v in res["theta"].items():
         print(f"  {k:6s} = {v: .6f}")
+    params_df = pd.DataFrame(res["theta"].items(), columns=["param", "value"])
+    file_exists = os.path.isfile("tBuOCl_params.csv")
+    params_df.to_csv("tBuOCl_params.csv", index=False, mode="a", header=not file_exists)
+
 
     # # Diagnostics
     # T = res["T"]

@@ -13,7 +13,7 @@ def g_from_alpha(alpha):
     return 1.82*np.sqrt(alpha)/(1 - alpha)
 
 def load_tsv(path, tmin, tmax):
-    df = pd.read_csv(path, delim_whitespace=True, header=None)
+    df = pd.read_csv(path, sep=r'\s+', header=None)
     df = df.iloc[:, :3]
     df.columns = ["T", "tau_mu", "alpha"]
     return df[(df["T"] >= tmin) & (df["T"] <= tmax)].reset_index(drop=True)
@@ -84,9 +84,11 @@ if __name__ == "__main__":
     path = PATH
     res = fit_orbach_params(path, tmin, tmax, w_mu=1.0, w_sd=1.0)
     print("Success:", res["success"], "|", res["message"])
-    print(f"Fitted parameters (Orbach-only, {tmin}-{tmax} K):")
+    print(f"Fitted parameters (Raman-only, {tmin}-{tmax} K):")
     for k, v in res["theta"].items():
         print(f"  {k:6s} = {v: .6f}")
+    params_df = pd.DataFrame(res["theta"].items(), columns=["param", "value"])
+    params_df.to_csv("tBuOCl_params.csv", index=False)
 
     # # Diagnostics
     # T = res["T"]
