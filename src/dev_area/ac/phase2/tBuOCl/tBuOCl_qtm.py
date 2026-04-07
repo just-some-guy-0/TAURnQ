@@ -6,7 +6,7 @@ from scipy.optimize import minimize
 
 LN10 = np.log(10)
 tmin = 9.7
-tmax = 12
+tmax = 9.7
 PATH = "tBuOCl.tsv"
 
 def g_from_alpha(alpha):
@@ -78,6 +78,10 @@ if __name__ == "__main__":
     print(f"Fitted parameters (QTM-only, {tmin}-{tmax} K):")
     for k, v in res["theta"].items():
         print(f"  {k:6s} = {v: .6f}")
+
+
+
+print(np.log(7.042600000E-01))
 
     # # Diagnostics (kept commented to match your style)
     # T = res["T"]
