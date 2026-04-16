@@ -1,0 +1,2 @@
+mu_A,mu_U,sd_A,sd_U,rho_AU,sd_A_lo,sd_A_hi,sd_U_lo,sd_U_hi,mu_R,mu_N,sd_R,sd_N,rho_RN,sd_R_lo,sd_R_hi,sd_N_lo,sd_N_hi,mu_Q,sd_Q,orbach_window,raman_window,qtm_window,infile
+-13.541405486240842,1844.541978712945,0.4283354856203475,77.88508510374147,-0.9682337090827303,,,,,,,,,,,,,,,,64.0-96.0,,,ac_testdata.tsv

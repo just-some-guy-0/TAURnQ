@@ -404,6 +404,16 @@ def parse_range(spec, nmax):
     return range(start, min(end, nmax), step)
 
 
+def _parse_window(s):
+    """Parse 'Tlo,Thi' string into (float, float) or None."""
+    if not s or str(s).strip() == "":
+        return None
+    parts = [float(x.strip()) for x in str(s).split(",")]
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError("Window must be 'Tlo,Thi'")
+    return (min(parts), max(parts))
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="TAURnQ DC Monte Carlo — window-aware, optional AC priors"
@@ -418,57 +428,210 @@ def main():
     ap.add_argument("--seed_base", type=int, default=14322)
     ap.add_argument("--plot",      action="store_true")
 
-    ac = ap.add_argument_group(
-        "AC priors (all optional)",
-        "If omitted, the corresponding term is dropped from the rate model "
-        "for rows where it would have been fixed.  A and Ueff are NEVER "
-        "fitted from DC data — if you have AC data, always pass them here."
+    win = ap.add_argument_group(
+        "Temperature windows (optional)",
+        "Override or supply window assignments for rows. "
+        "If the input CSV already has in_qtm_window / in_raman_window columns "
+        "(written by dc_phase2.py), those are used by default. "
+        "Supplying these arguments overrides the CSV flags entirely, "
+        "letting you refine Q over a narrower or different range without "
+        "re-running dc_phase2."
     )
-    ac.add_argument("--ac_A",    type=float, default=None, help="A mean (Orbach prefactor)")
-    ac.add_argument("--ac_Ueff", type=float, default=None, help="Ueff mean (K)")
-    ac.add_argument("--ac_sA",   type=float, default=0.15)
-    ac.add_argument("--ac_sU",   type=float, default=20.0)
-    ac.add_argument("--ac_R",    type=float, default=None, help="R mean (Raman prefactor)")
-    ac.add_argument("--ac_n",    type=float, default=None, help="n mean (Raman exponent)")
-    ac.add_argument("--ac_sR",   type=float, default=0.35)
-    ac.add_argument("--ac_sN",   type=float, default=0.25)
-    ac.add_argument("--ac_Q",    type=float, default=None,
-                    help="Q prior (starting guess for QTM rows, fixed for Raman rows)")
-    ac.add_argument("--ac_sQ",   type=float, default=0.21)
+    win.add_argument("--qtm_window",   default="", metavar="Tlo,Thi",
+                     help="Temperature range to fit Q/sQ, e.g. '2,9'. "
+                          "Rows inside → QTM fit. Overrides in_qtm_window column.")
+    win.add_argument("--raman_window", default="", metavar="Tlo,Thi",
+                     help="Temperature range to fit R/n/sR/sN, e.g. '13,23'. "
+                          "Rows inside → Raman fit. Overrides in_raman_window column.")
+
+    pr = ap.add_argument_group(
+        "Priors for fixed terms (all optional)",
+        "Values for terms not being fitted in a given window. "
+        "Can come from ac_phase2/ac_montecarlo (AC experiment) or from "
+        "dc_phase2 compiled estimates (DC-only experiment). "
+        "Missing priors drop that term from the rate model entirely. "
+        "A and Ueff are NEVER fitted from DC data."
+    )
+    # New --pr_* names (preferred)
+    pr.add_argument("--pr_A",    type=float, default=None, help="A mean (Orbach prefactor, from AC)")
+    pr.add_argument("--pr_Ueff", type=float, default=None, help="Ueff mean in K (from AC)")
+    pr.add_argument("--pr_sA",   type=float, default=0.15)
+    pr.add_argument("--pr_sU",   type=float, default=20.0)
+    pr.add_argument("--pr_R",    type=float, default=None, help="R mean (Raman prefactor)")
+    pr.add_argument("--pr_n",    type=float, default=None, help="n mean (Raman exponent)")
+    pr.add_argument("--pr_sR",   type=float, default=0.35)
+    pr.add_argument("--pr_sN",   type=float, default=0.25)
+    pr.add_argument("--pr_Q",    type=float, default=None,
+                    help="Q prior — from dc_phase2 compiled estimate or AC fit")
+    pr.add_argument("--pr_sQ",   type=float, default=0.21)
+    # Old --ac_* names kept as silent aliases for backward compatibility
+    pr.add_argument("--ac_A",    type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_Ueff", type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_sA",   type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_sU",   type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_R",    type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_n",    type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_sR",   type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_sN",   type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_Q",    type=float, default=None, help=argparse.SUPPRESS)
+    pr.add_argument("--ac_sQ",   type=float, default=None, help=argparse.SUPPRESS)
 
     args = ap.parse_args()
 
-    # build ac dict — only include keys where the value was actually provided
+    # --pr_* takes precedence; fall back to --ac_* alias if --pr_* not set
+    def _resolve(pr_val, ac_val): return pr_val if pr_val is not None else ac_val
+
+    A_val    = _resolve(args.pr_A,    args.ac_A)
+    Ueff_val = _resolve(args.pr_Ueff, args.ac_Ueff)
+    sA_val   = _resolve(args.pr_sA,   args.ac_sA)   or 0.15
+    sU_val   = _resolve(args.pr_sU,   args.ac_sU)   or 20.0
+    R_val    = _resolve(args.pr_R,    args.ac_R)
+    n_val    = _resolve(args.pr_n,    args.ac_n)
+    sR_val   = _resolve(args.pr_sR,   args.ac_sR)   or 0.35
+    sN_val   = _resolve(args.pr_sN,   args.ac_sN)   or 0.25
+    Q_val    = _resolve(args.pr_Q,    args.ac_Q)
+    sQ_val   = _resolve(args.pr_sQ,   args.ac_sQ)   or 0.21
+
+    # build priors dict — only include keys where the value was actually provided
     ac_priors = {}
-    if args.ac_A    is not None: ac_priors.update({'A':    args.ac_A,    'sA': args.ac_sA})
-    if args.ac_Ueff is not None: ac_priors.update({'Ueff': args.ac_Ueff, 'sU': args.ac_sU})
-    if args.ac_R    is not None: ac_priors.update({'R':    args.ac_R,    'sR': args.ac_sR})
-    if args.ac_n    is not None: ac_priors.update({'n':    args.ac_n,    'sN': args.ac_sN})
-    if args.ac_Q    is not None: ac_priors.update({'Q':    args.ac_Q,    'sQ': args.ac_sQ})
+    if A_val    is not None: ac_priors.update({'A':    A_val,    'sA': sA_val})
+    if Ueff_val is not None: ac_priors.update({'Ueff': Ueff_val, 'sU': sU_val})
+    if R_val    is not None: ac_priors.update({'R':    R_val,    'sR': sR_val})
+    if n_val    is not None: ac_priors.update({'n':    n_val,    'sN': sN_val})
+    if Q_val    is not None: ac_priors.update({'Q':    Q_val,    'sQ': sQ_val})
 
     # summarise what mode we are in
     has_orbach = 'A' in ac_priors and 'Ueff' in ac_priors
     has_raman  = 'R' in ac_priors and 'n'    in ac_priors
     has_Q      = 'Q' in ac_priors
 
-    print("AC priors provided:")
-    print(f"  Orbach (A, Ueff): {'YES — fixed in all DC rows' if has_orbach else 'NO  — Orbach term dropped from model'}")
-    print(f"  Raman  (R, n):    {'YES — fixed in QTM rows'    if has_raman  else 'NO  — Raman term dropped from QTM rows'}")
-    print(f"  Q prior:          {'YES — start/fix for Raman rows' if has_Q   else 'NO  — Q term dropped from Raman rows'}")
-    if not has_orbach:
-        print("  NOTE: without A/Ueff, QTM rows fit tau^-1 = 10^R*T^n + 10^-Q  (or just 10^-Q if no Raman either)")
+    print("Priors provided:")
+    if has_orbach:
+        print(f"  A    = {ac_priors['A']:.4f} ± {ac_priors['sA']:.4f}  "
+              f"Ueff = {ac_priors['Ueff']:.2f} ± {ac_priors['sU']:.2f}  "
+              f"(fixed in all DC rows — from AC data)")
+    else:
+        print("  Orbach (A, Ueff): not provided — Orbach term dropped from model")
+    if has_raman:
+        print(f"  R    = {ac_priors['R']:.4f} ± {ac_priors['sR']:.4f}  "
+              f"n    = {ac_priors['n']:.4f} ± {ac_priors['sN']:.4f}  "
+              f"(fixed in QTM rows)")
+    else:
+        print("  Raman  (R, n):    not provided — Raman term dropped from QTM rows")
+    if has_Q:
+        print(f"  Q    = {ac_priors['Q']:.4f} ± {ac_priors['sQ']:.4f}  "
+              f"(start for QTM rows, fixed in Raman rows)")
+    else:
+        print("  Q prior:          not provided — Q term dropped from Raman rows")
 
-    df = pd.read_csv(args.infile)
+    import csv as _csv
+    with open(args.infile, newline="", encoding="utf-8-sig") as fh:
+        sample = fh.read(4096)
+    try:
+        sep = _csv.Sniffer().sniff(sample).delimiter
+    except Exception:
+        sep = ","
+
+    # try with header first, then without
+    df = pd.read_csv(args.infile, sep=sep, engine="python")
+    cols_lower = [str(c).lower().strip() for c in df.columns]
+
+    # detect headerless raw DC file: 3 numeric columns, first row all floats
+    def _looks_headerless(df):
+        try:
+            df.iloc[0].astype(float)
+            return True
+        except (ValueError, TypeError):
+            return False
+
+    # detect headerless: column names are integers or non-descriptive
+    is_headerless = all(str(c).strip().lstrip('-').replace('.','').isdigit()
+                        for c in df.columns)
+    if is_headerless:
+        df = pd.read_csv(args.infile, sep=sep, engine="python", header=None)
+        df.columns = [str(i) for i in range(len(df.columns))]
+        cols_lower = list(df.columns)
+
+    # map to lowercase for detection
+    df_detect = df.copy()
+    df_detect.columns = cols_lower
+
+    # ── detect if the user passed the raw DC data file instead of dc_phase2 output ──
+    # Raw DC file: either has tau_star/beta columns, or is headerless with 3 numeric cols
+    phase2_cols = {"mu_ln", "sigma1_ln", "sigma2_ln"}
+    has_phase2  = phase2_cols.issubset(set(cols_lower))
+    has_raw_header = {"tau_star", "beta"}.issubset(set(cols_lower))
+    # headerless with 3 cols = almost certainly T | tau_star | beta
+    has_raw_headerless = is_headerless and len(df.columns) <= 4
+
+    if (has_raw_header or has_raw_headerless) and not has_phase2:
+        stem       = os.path.splitext(os.path.basename(args.infile))[0]
+        phase2_out = f"{stem}_phase2.csv"
+        qtm_hint   = f" --qtm_window {args.qtm_window}"    if args.qtm_window   else ""
+        raman_hint = f" --raman_window {args.raman_window}" if args.raman_window else ""
+        prior_flags = ""
+        if Q_val    is not None: prior_flags += f" --pr_Q {Q_val} --pr_sQ {sQ_val}"
+        if A_val    is not None: prior_flags += f" --pr_A {A_val} --pr_sA {sA_val}"
+        if Ueff_val is not None: prior_flags += f" --pr_Ueff {Ueff_val} --pr_sU {sU_val}"
+        if R_val    is not None: prior_flags += f" --pr_R {R_val} --pr_n {n_val}"
+
+        print("ERROR: --infile appears to be a raw DC data file (T, tau_star, beta).",
+              file=sys.stderr)
+        print("       dc_montecarlo requires the dc_phase2.py output, not the raw data.",
+              file=sys.stderr)
+        print(f"\n  Step 1 — run dc_phase2.py first:", file=sys.stderr)
+        print(f"    python dc_phase2.py --infile {args.infile}"
+              f"{qtm_hint}{raman_hint} --outfile {phase2_out}", file=sys.stderr)
+        print(f"\n  Step 2 — then run dc_montecarlo.py:", file=sys.stderr)
+        print(f"    python dc_montecarlo.py --infile {phase2_out}"
+              f"{qtm_hint}{raman_hint}{prior_flags}", file=sys.stderr)
+        sys.exit(1)
+
+    # restore proper column names for phase2 output
+    df.columns = cols_lower
+    if "t" in df.columns and "T" not in df.columns:
+        df = df.rename(columns={"t": "T"})
+
     required = {"T", "mu_ln", "sigma1_ln", "sigma2_ln"}
     if missing := required - set(df.columns):
-        print(f"ERROR: missing columns: {missing}", file=sys.stderr); sys.exit(1)
+        print(f"ERROR: missing columns: {missing}", file=sys.stderr)
+        print("       Expected dc_phase2.py output with columns: "
+              "T, mu_ln, sigma1_ln, sigma2_ln", file=sys.stderr)
+        sys.exit(1)
 
-    if "in_qtm_window" not in df.columns or "in_raman_window" not in df.columns:
-        print("WARNING: window flags missing — re-run dc_phase2.py with "
-              "--qtm_window and --raman_window", file=sys.stderr)
-        print("Defaulting: all rows treated as QTM window.", file=sys.stderr)
+    # ── resolve window flags ─────────────────────────────────────────────────
+    qtm_w   = _parse_window(args.qtm_window)
+    raman_w = _parse_window(args.raman_window)
+
+    if qtm_w or raman_w:
+        # CLI windows provided — override any existing columns
+        if "in_qtm_window" in df.columns or "in_raman_window" in df.columns:
+            print("  NOTE: --qtm_window/--raman_window provided — "
+                  "overriding window flag columns from input CSV.")
+        df["in_qtm_window"]   = (df["T"].between(qtm_w[0],   qtm_w[1])
+                                 if qtm_w   else pd.Series(False, index=df.index))
+        df["in_raman_window"] = (df["T"].between(raman_w[0], raman_w[1])
+                                 if raman_w else pd.Series(False, index=df.index))
+        if qtm_w:
+            print(f"  QTM   window {qtm_w[0]:.1f}–{qtm_w[1]:.1f} K: "
+                  f"{int(df['in_qtm_window'].sum())} rows → fit Q, sQ")
+        if raman_w:
+            print(f"  Raman window {raman_w[0]:.1f}–{raman_w[1]:.1f} K: "
+                  f"{int(df['in_raman_window'].sum())} rows → fit R, n, sR, sN")
+    elif "in_qtm_window" not in df.columns or "in_raman_window" not in df.columns:
+        print("WARNING: no window flags found and no --qtm_window/--raman_window "
+              "supplied.", file=sys.stderr)
+        print("  Re-run dc_phase2.py with --qtm_window / --raman_window, or "
+              "pass --qtm_window here.", file=sys.stderr)
+        print("  Defaulting: all rows treated as QTM window.", file=sys.stderr)
         df["in_qtm_window"]   = True
         df["in_raman_window"] = False
+    else:
+        # use existing columns from dc_phase2 output — report coverage
+        n_qtm_csv   = int(df["in_qtm_window"].sum())
+        n_raman_csv = int(df["in_raman_window"].sum())
+        print(f"  Using window flags from input CSV: "
+              f"QTM={n_qtm_csv} rows  Raman={n_raman_csv} rows")
 
     df = df.reset_index(drop=True)
     nrows   = len(df)

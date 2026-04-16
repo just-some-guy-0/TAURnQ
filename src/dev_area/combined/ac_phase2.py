@@ -160,8 +160,9 @@ def fit_orbach(df_window, w_mu=1.0, w_sd=1.0, verbose=True):
     th0   = np.array([a / LN10, b,
                       max(gbar / LN10 * 0.5, 1e-5),
                       max(gbar * float(np.mean(T)) * 0.1, 1e-3),
-                      0.0])
-    bnds  = [(None,None),(None,None),(0.0,None),(0.0,None),(-0.999,0.999)]
+                      0.5])    # warm-start rho at +0.5 (Orbach must be positive)
+    # rho_AU must be >= 0: higher barrier compensated by larger prefactor
+    bnds  = [(None,None),(None,None),(0.0,None),(0.0,None),(0.0,0.999)]
 
     res = minimize(_orbach_objective, th0,
                    args=(T, mu_ln_tgt, sd_ln_tgt, w_mu, w_sd),
@@ -481,10 +482,10 @@ def main():
         # QTM
         "mu_Q":    qtm.get("mu_Q",  np.nan),
         "sd_Q":    qtm.get("sd_Q",  np.nan),
-        # metadata
-        "orbach_window": str(orbach_w) if orbach_w else "",
-        "raman_window":  str(raman_w)  if raman_w  else "",
-        "qtm_window":    str(qtm_w)    if qtm_w    else "",
+        # metadata — use dash separator to avoid unquoted commas in CSV
+        "orbach_window": f"{orbach_w[0]}-{orbach_w[1]}" if orbach_w else "",
+        "raman_window":  f"{raman_w[0]}-{raman_w[1]}"  if raman_w  else "",
+        "qtm_window":    f"{qtm_w[0]}-{qtm_w[1]}"      if qtm_w    else "",
         "infile":        args.infile,
     }
 

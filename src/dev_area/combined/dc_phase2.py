@@ -335,17 +335,22 @@ def process_file(infile, outfile, make_plot=False,
             "As_dc": np.nan,
             "Us_dc": np.nan,
 
-            # ── Raman: only valid inside raman_window ─────────────────────
-            # The TPN mu/sigma1/sigma2 encode the full tau distribution;
-            # R/n cannot be isolated per-row from a single-T DC fit alone.
-            # These are NaN here — the MC phase uses the raman_window flag
-            # to restrict which rows contribute to R/n priors.
-            "Ru_dc": fit["mu_ln"] if in_raman else np.nan,
-            "Rs_dc": fit["sigma1_ln"] if in_raman else np.nan,
-
             # ── QTM: valid inside qtm_window only ─────────────────────────
-            "Qu_dc": fit["mu_ln"]      if in_qtm else np.nan,
-            "Qs_dc": fit["sigma1_ln"]  if in_qtm else np.nan,
+            # Q = log10(tau_QTM) = elnTau_ln / ln(10)
+            # sQ proxy = sigma1_ln / ln(10)  (left-side spread of TPN)
+            "Qu_dc": fit["elnTau_ln"] / np.log(10) if in_qtm else np.nan,
+            "Qs_dc": fit["sigma1_ln"] / np.log(10) if in_qtm else np.nan,
+
+            # ── Raman: only valid inside raman_window ─────────────────────
+            # Ru_dc and Nu_dc cannot be computed per-row — R and n are
+            # determined by the temperature SLOPE across Raman-window rows,
+            # not by a single temperature. These are set to NaN here and
+            # computed in the post-processing summary below after all rows
+            # are available. The compiled R/n estimates are printed and
+            # written as metadata but not per-row.
+            "Ru_dc": np.nan,
+            "Nu_dc": np.nan,
+            "Rs_dc": fit["sigma1_ln"] / np.log(10) if in_raman else np.nan,
         }
         records.append(rec)
 
@@ -373,9 +378,92 @@ def process_file(infile, outfile, make_plot=False,
     n_qtm_valid   = out_df["in_qtm_window"].sum()
     n_raman_valid = out_df["in_raman_window"].sum()
     print(f"\nWrote {len(records)} rows → {os.path.abspath(outfile)}")
-    print(f"  Valid Q priors (QTM window):   {n_qtm_valid} rows")
+    print(f"  Valid Q priors (QTM window):     {n_qtm_valid} rows")
     print(f"  Valid R/n priors (Raman window): {n_raman_valid} rows")
     print(f"  Valid A/Ueff priors (Orbach):    0 rows  (NaN — use AC data)")
+
+    # ── Compiled parameter estimates for dc_montecarlo ──────────────────────
+    # IVW-average the per-row estimates within each window to give starting
+    # point values ready to pass as --pr_Q / --pr_R / --pr_n.
+    print("\n=== Compiled prior estimates for dc_montecarlo ===")
+    print("    (pass these directly as --pr_* arguments)\n")
+
+    def _ivw(vals, sds):
+        v = np.asarray(vals, float); s = np.asarray(sds, float)
+        ok = np.isfinite(v) & np.isfinite(s) & (s > 0)
+        if not ok.any(): return np.nan, np.nan
+        w = 1.0 / s[ok] ** 2
+        mean = float(np.sum(w * v[ok]) / np.sum(w))
+        sem  = float(1.0 / np.sqrt(np.sum(w)))
+        return mean, sem
+
+    qtm_rows = out_df[out_df["in_qtm_window"]]
+    if not qtm_rows.empty:
+        Q_mean, Q_sem = _ivw(qtm_rows["Qu_dc"], qtm_rows["Qs_dc"])
+        sQ_med = float(np.nanmedian(qtm_rows["Qs_dc"]))
+        print(f"  Q  (IVW mean ± SEM): {Q_mean:.4f} ± {Q_sem:.4f}")
+        print(f"  sQ (median spread):  {sQ_med:.4f}")
+        print(f"\n  → --pr_Q {Q_mean:.6f} --pr_sQ {sQ_med:.6f}")
+    else:
+        print("  Q: no QTM-window rows")
+
+    raman_rows = out_df[out_df["in_raman_window"]]
+    if not raman_rows.empty and not qtm_rows.empty:
+        # R and n are determined by the temperature slope of the Raman rate
+        # across the Raman-window rows. We subtract the QTM contribution
+        # (using the compiled Q) to isolate the Raman rate at each T.
+        Q_compiled = Q_mean if np.isfinite(Q_mean) else np.nanmedian(qtm_rows["Qu_dc"])
+        r_qtm = 10.0 ** (-Q_compiled)
+
+        T_raman     = raman_rows["T"].values
+        eln_raman   = raman_rows["elnTau_ln"].values
+        r_total     = np.exp(-eln_raman)          # 1/e^<lntau> at each T
+        r_raman     = r_total - r_qtm             # subtract QTM
+
+        # only use rows where Raman rate is positive (QTM must not dominate fully)
+        ok = r_raman > 0.05 * r_total             # Raman > 5% of total
+        if ok.sum() >= 2:
+            log10_T   = np.log10(T_raman[ok])
+            log10_r   = np.log10(r_raman[ok])
+            coeffs    = np.polyfit(log10_T, log10_r, 1)
+            n_est     = float(coeffs[0])
+            R_est     = float(coeffs[1])
+            # residual spread as a proxy for uncertainty
+            resid     = log10_r - np.polyval(coeffs, log10_T)
+            sR_est    = float(np.std(resid)) if len(resid) > 2 else 0.5
+            sN_est    = sR_est  # rough proxy — slope uncertainty
+
+            print(f"\n  R  (slope fit, {ok.sum()} rows): {R_est:.4f}")
+            print(f"  n  (slope fit, {ok.sum()} rows): {n_est:.4f}")
+            print(f"  sR (residual spread):  {sR_est:.4f}")
+            print(f"  sN (residual spread):  {sN_est:.4f}")
+            print(f"\n  → --pr_R {R_est:.6f} --pr_sR {max(sR_est, 0.3):.6f} "
+                  f"--pr_n {n_est:.6f} --pr_sN {max(sN_est, 0.2):.6f}")
+            if ok.sum() < len(T_raman):
+                skipped = T_raman[~ok]
+                print(f"\n  NOTE: {(~ok).sum()} row(s) excluded (QTM-dominated): "
+                      f"T={skipped} K")
+
+            # write compiled R/n back into the Raman rows of the output CSV
+            # so downstream scripts can use them
+            out_df.loc[out_df["in_raman_window"], "Ru_dc"] = R_est
+            out_df.loc[out_df["in_raman_window"], "Nu_dc"] = n_est
+            out_df.loc[out_df["in_raman_window"], "Rs_dc"] = max(sR_est, 0.3)
+            out_df.to_csv(outfile, index=False)   # rewrite with R/n filled in
+            print(f"\n  Wrote R/n estimates back to {os.path.abspath(outfile)}")
+        else:
+            print(f"\n  Raman window: {len(raman_rows)} rows but fewer than 2 have "
+                  f"resolvable Raman signal — R and n not estimable from DC data.")
+            print(f"  All Raman-window rows are QTM-dominated. "
+                  f"Use AC data for R and n.")
+    elif not raman_rows.empty:
+        print(f"\n  Raman window: {len(raman_rows)} rows — "
+              f"no QTM window data to subtract, cannot estimate R/n.")
+        print(f"  Run with --qtm_window as well to enable R/n estimation.")
+
+    print()
+    print("  NOTE: A and Ueff are not estimable from DC data.")
+    print("  If you have AC data, pass --pr_A and --pr_Ueff from ac_phase2/ac_montecarlo.")
 
     if make_plot:
         _diagnostic_plot(df, out_df)
