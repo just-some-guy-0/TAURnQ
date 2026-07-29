@@ -395,6 +395,16 @@ def load_ac_tsv(path):
 def load_dc_phase2(path):
     df = pd.read_csv(path)
     _ensure_cols(df, {"T", "mu_ln", "sigma1_ln", "sigma2_ln"}, "dc_phase2")
+    # elnTau_ln is the correct centre: e^<lntau> = geometric mean of the SEF
+    # mu_ln is only the TPN location parameter (mode of left half-Gaussian)
+    # Use elnTau_ln when available, fall back to mu_ln with a warning
+    if "elnTau_ln" in df.columns:
+        df["_centre_ln"] = df["elnTau_ln"]
+    else:
+        print("  WARNING: dc_phase2 file has no elnTau_ln column — "
+              "falling back to mu_ln. Re-run dc_phase2.py to get elnTau_ln.",
+              file=sys.stderr)
+        df["_centre_ln"] = df["mu_ln"]
     return df.reset_index(drop=True)
 
 
@@ -465,7 +475,7 @@ def build_rows(df_ac_params, df_ac_tsv,
                 rows.append({
                     "T":           T,
                     "target_type": "tpn",
-                    "tpn_mu_ln":   float(r["mu_ln"]),
+                    "tpn_mu_ln":   float(r["_centre_ln"]),
                     "tpn_s1":      float(r["sigma1_ln"]),
                     "tpn_s2":      float(r["sigma2_ln"]),
                     "weight":      weight,
@@ -725,6 +735,10 @@ def main():
                          ridge_Q=args.ridgeQ,
                          fixed_rho_AU=fixed_rho_AU,
                          fixed_rho_RN=fixed_rho_RN)
+
+    mu0, sig0, _, _ = unpack(x0, fixed_rho_AU, fixed_rho_RN)
+    print(f"\n  Starting: A={mu0[0]:.4f}  Ueff={mu0[1]:.2f}  "
+          f"R={mu0[2]:.4f}  N={mu0[3]:.4f}  Q={mu0[4]:.4f}")
 
     print(f"\n  Nelder-Mead  maxiter={args.maxiter}  K={args.K}  "
           f"rows={len(rows)}...")
