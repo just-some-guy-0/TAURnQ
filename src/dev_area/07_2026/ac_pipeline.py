@@ -138,7 +138,7 @@ def apply_cli_overrides(priors, args):
                       f"width drastically.")
 
     if 'rho_AU' in priors:
-        priors['rho_AU'] = float(np.clip(priors['rho_AU'], 0.0, 0.999))
+        priors['rho_AU'] = float(np.clip(priors['rho_AU'], -0.999, 0.0))
     if 'rho_RN' in priors:
         priors['rho_RN'] = float(np.clip(priors['rho_RN'], -0.999, 0.0))
     return priors, src

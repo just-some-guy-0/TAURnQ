@@ -201,9 +201,9 @@ def fit_orbach(df_window, w_mu=1.0, w_sd=1.0, verbose=True):
     th0   = np.array([a / LN10, b,
                       max(gbar / LN10 * 0.5, 1e-5),
                       max(gbar * float(np.mean(T)) * 0.1, 1e-3),
-                      0.5])    # warm-start rho at +0.5 (Orbach must be positive)
-    # rho_AU must be >= 0: higher barrier compensated by larger prefactor
-    bnds  = [(None,None),(None,None),(0.0,None),(0.0,None),(0.0,0.999)]
+                      -0.5])   # warm-start rho negative: steeper barrier needs
+    # smaller prefactor to pass through the same tau, so A and U anti-correlate
+    bnds  = [(None,None),(None,None),(0.0,None),(0.0,None),(-0.999,0.999)]
 
     res = minimize(_orbach_objective, th0,
                    args=(T, mu_ln_tgt, sd_ln_tgt, w_mu, w_sd),
@@ -231,7 +231,7 @@ def fit_orbach(df_window, w_mu=1.0, w_sd=1.0, verbose=True):
     # ρ profile  (positive correlation expected for Orbach)
     M         = len(T)
     thr       = 3.84 / max(2 * M, 1)        # MSE-scale χ²(1) threshold
-    rho_grid  = np.linspace(0.0, 0.9, 19)
+    rho_grid  = np.linspace(-0.99, 0.99, 41)
     keep      = _profile_rho(_orbach_objective, res.x,
                               T, mu_ln_tgt, sd_ln_tgt,
                               rho_grid, loss_free, thr,

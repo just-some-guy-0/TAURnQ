@@ -20,11 +20,28 @@ c. Quantile targets are precomputed once in build_rows (they do not depend
    call — required now that DC targets involve stable-distribution isf.
 d. rho reparametrised: sigmoid map R -> (0, 0.999) with nonzero gradient
    everywhere, replacing tanh(x)**2 whose gradient vanished at rho = 0 and
-   which saturated by |x| ~ 3 (Nelder-Mead parked on the 0.999 plateau).
+   which saturated near +/-1 (Nelder-Mead parked on the 0.999 plateau).
    Sign conventions unchanged (rho_AU >= 0, rho_RN <= 0).
 e. CLI-supplied fixed rho values are clipped to the valid range; the old
    pipeline had emitted |rho| > 1, which draw_params silently laundered
    through max(1 - rho**2, 1e-12).
+
+CORRECTIONS (2026-07-29)
+--------------------------------------
+f. compile_window: the RN and Q branches now use a robust MEDIAN over the
+   windowed rows, not an inverse-variance-weighted mean — matching what the
+   AU branch already did, and for the same reason. A single temperature
+   cannot separate R from N (or A from Ueff, or resolve Q); those per-row
+   values are unidentified, and their reported per-row spread (Rs/Ns/Qs)
+   reflects optimiser flatness, not physical uncertainty. IVW weights by
+   1/spread**2, so a handful of rows that happened to clamp a parameter to
+   its bound with a spuriously tiny spread dominate the compiled target and
+   drag it to the penalty ceiling (this is what produced N ~= 12, sitting on
+   the qout(N,0,12) bound, with R dragged very negative along the C-n ridge
+   to compensate). The median reports the bulk of the window instead.
+g. --show_compile prints the raw windowed (T, param, spread) rows that feed
+   each compiled target, so you can see whether the compiled value reflects
+   the bulk of the window or a couple of outliers.
 
 KEY CHANGES from the previous version
 --------------------------------------
@@ -188,7 +205,7 @@ def unpack(x, fixed_rho_AU=None, fixed_rho_RN=None):
     # sign conventions retained: rho_AU >= 0 (with tau = 10^A e^{U/T}, a
     # higher barrier is compensated by a larger prefactor), rho_RN <= 0
     # (intercept/slope anticorrelation of the Raman power law for T > 1 K)
-    rho_AU = fixed_rho_AU if fixed_rho_AU is not None else _rho_from_x(x[10])
+    rho_AU = fixed_rho_AU if fixed_rho_AU is not None else -_rho_from_x(x[10])
     rho_RN = fixed_rho_RN if fixed_rho_RN is not None else -_rho_from_x(x[11])
     return mu, sigmas, rho_AU, rho_RN
 
@@ -196,6 +213,11 @@ def unpack(x, fixed_rho_AU=None, fixed_rho_RN=None):
 # ---------------------------------------------------------------------------
 # Window / compilation helpers
 # ---------------------------------------------------------------------------
+
+# When True, compile_window prints the raw windowed rows that feed each
+# compiled target (set from main() by --show_compile).
+_VERBOSE_COMPILE = False
+
 
 def parse_window(s):
     if not s or str(s).strip() == "":
@@ -236,9 +258,25 @@ def _sigma_floor(vals, abs_floor=0.02, quantile_floor=0.25):
     return max(abs_floor, float(np.quantile(v, quantile_floor)))
 
 
+def _dump_window(sub, which):
+    """Print the raw windowed rows feeding a compiled target."""
+    cols_by = {"AU": ["T", "Au", "As", "Uu", "Us"],
+               "RN": ["T", "Ru", "Rs", "Nu", "Ns"],
+               "Q":  ["T", "Qu", "Qs"]}
+    cols = [c for c in cols_by[which] if c in sub.columns]
+    if not cols:
+        return
+    print(f"\n  [compile {which}] {len(sub)} row(s) in window:")
+    with pd.option_context("display.float_format", lambda v: f"{v:9.4f}"):
+        print("    " + sub[cols].to_string(index=False).replace("\n", "\n    "))
+
+
 def compile_window(df, mask, which):
     """Compile mean and spread for a parameter group from windowed rows."""
     sub = df[mask].copy()
+
+    if _VERBOSE_COMPILE and not sub.empty:
+        _dump_window(sub, which)
 
     if which == "AU":
         sub = sub.dropna(subset=["Au", "As", "Uu", "Us"])
@@ -259,9 +297,21 @@ def compile_window(df, mask, which):
         sub = sub.dropna(subset=["Ru", "Rs", "Nu", "Ns"])
         if sub.empty:
             return None
+        # Robust median for (R, N), for exactly the same reason as (A, Ueff):
+        # a single temperature only constrains the TOTAL rate there, so it has
+        # no leverage to separate the Raman prefactor R from the exponent N.
+        # The per-row (R, N) are therefore unidentified and Ns reflects
+        # optimiser flatness, not physical spread. An inverse-variance-weighted
+        # mean (weight = 1/Ns**2) lets a couple of rows that clamped N to its
+        # qout() bound with a spuriously tiny Ns bulldoze every well-behaved
+        # row — the mechanism that produced N ~= 12 with R dragged very
+        # negative along the C-n ridge to compensate. The median reports the
+        # bulk of the window. (Independent medians of R and N can land slightly
+        # off the C-n ridge; that is acceptable for a starting point / domain
+        # target — the global quantile loss re-couples them.)
         floor_R = _sigma_floor(sub["Rs"].values)
         floor_N = _sigma_floor(sub["Ns"].values)
-        return ((ivw_mean(sub["Ru"], sub["Rs"]), ivw_mean(sub["Nu"], sub["Ns"])),
+        return ((robust_med(sub["Ru"].values), robust_med(sub["Nu"].values)),
                 (max(robust_med(sub["Rs"].values), floor_R),
                  max(robust_med(sub["Ns"].values), floor_N)))
 
@@ -269,12 +319,38 @@ def compile_window(df, mask, which):
         sub = sub.dropna(subset=["Qu", "Qs"])
         if sub.empty:
             return None
+        # Robust median for Q too — same identifiability argument, and with
+        # often only a handful of QTM-window rows the IVW is especially fragile
+        # (one tight row dominates the whole compiled value).
         floor_Q = _sigma_floor(sub["Qs"].values)
-        return ((ivw_mean(sub["Qu"], sub["Qs"]),),
+        return ((robust_med(sub["Qu"].values),),
                 (max(robust_med(sub["Qs"].values), floor_Q),))
 
 
-def build_initials(df_ac, df_dc, AU_w, RN_w, Q_w):
+def load_phase2_means(path):
+    """Read the clean, window-fitted parameter MEANS from an ac_phase2_out.csv.
+
+    Phase 2 fits each process across its whole window, so its mu_* are the
+    identifiable location estimates (they reproduce R&C). The per-row Monte
+    Carlo A/U/R/n/Q columns, by contrast, are single-temperature and
+    degenerate — a median over them lands on noise (e.g. n pulled to ~9 by a
+    row that read n=37). When a phase-2 file is supplied we therefore seed the
+    means from it and use the per-row compile only for the spreads (which the
+    global quantile loss re-fits anyway) and as a fallback.
+
+    Returns a dict with any of A, Ueff, R, N, Q that are present & finite.
+    """
+    df = pd.read_csv(path)
+    row = df.iloc[0]
+    out = {}
+    for key, col in [("A", "mu_A"), ("Ueff", "mu_U"), ("R", "mu_R"),
+                     ("N", "mu_N"), ("Q", "mu_Q")]:
+        if col in df.columns and np.isfinite(row[col]):
+            out[key] = float(row[col])
+    return out
+
+
+def build_initials(df_ac, df_dc, AU_w, RN_w, Q_w, phase2_means=None):
     """
     Build x0 and compiled domain targets.
 
@@ -282,6 +358,10 @@ def build_initials(df_ac, df_dc, AU_w, RN_w, Q_w):
       AU compilation  → AC rows in AU_window  (Orbach data lives here)
       RN compilation  → AC rows in RN_window, DC fallback
       Q  compilation  → DC rows in Q_window,  AC fallback
+
+    phase2_means : optional dict {A,Ueff,R,N,Q} from load_phase2_means(). When
+    given, these OVERRIDE the per-row-median means (the per-row values are
+    degenerate); spreads still come from the per-row compile.
     """
     def _try(df, w, which):
         if df is None or df.empty:
@@ -302,6 +382,14 @@ def build_initials(df_ac, df_dc, AU_w, RN_w, Q_w):
     (R0,  N0),  (sR0, sN0) = safe(rn, 2)
     (Q0,),      (sQ0,)     = safe(q,  1)
 
+    # Prefer phase-2 window-fitted MEANS over the degenerate per-row medians.
+    if phase2_means:
+        A0 = phase2_means.get("A",    A0)
+        U0 = phase2_means.get("Ueff", U0)
+        R0 = phase2_means.get("R",    R0)
+        N0 = phase2_means.get("N",    N0)
+        Q0 = phase2_means.get("Q",    Q0)
+
     clamp = lambda v: max(v if np.isfinite(v) else 1e-3, 1e-3)
     sA0, sU0, sR0, sN0, sQ0 = map(clamp, [sA0, sU0, sR0, sN0, sQ0])
 
@@ -316,16 +404,21 @@ def build_initials(df_ac, df_dc, AU_w, RN_w, Q_w):
         m = np.isfinite(x) & np.isfinite(y)
         return float(np.corrcoef(x[m], y[m])[0, 1]) if m.sum() >= 3 else fb
 
-    rAU = np.clip(safe_corr("Au", "Uu"), 0.0, 0.95)
-    rRN = np.clip(-abs(safe_corr("Ru", "Nu")), -0.95, 0.0)
+    # rho_AU is anti-correlation (intercept/slope of ln tau vs 1/T), so the
+    # seed magnitude uses |corr|; unpack() applies the negative sign via
+    # -_rho_from_x. Clamping to >= 0 here (the old code) would have seeded the
+    # wrong sign. rho_RN is likewise <= 0.
+    rAU = np.clip(abs(safe_corr("Au", "Uu")), 0.0, 0.95)
+    rRN = np.clip(abs(safe_corr("Ru", "Nu")), 0.0, 0.95)
 
-    # start |rho| at >= 0.10 so the sigmoid gradient is healthy at x0
+    # start |rho| at >= 0.10 so the sigmoid gradient is healthy at x0.
+    # x[10], x[11] encode the MAGNITUDE; unpack() negates both.
     x0 = np.array([A0, U0, R0, N0, Q0,
                    np.log(max(sA0, 1e-6)), np.log(max(sU0, 1e-6)),
                    np.log(max(sR0, 1e-6)), np.log(max(sN0, 1e-6)),
                    np.log(max(sQ0, 1e-6)),
                    _x_from_rho(np.clip(max(rAU, 0.10), 0.10, 0.95)),
-                   _x_from_rho(np.clip(max(abs(rRN), 0.10), 0.10, 0.95))],
+                   _x_from_rho(np.clip(max(rRN, 0.10), 0.10, 0.95))],
                   dtype=float)
 
     compiled = {
@@ -615,6 +708,11 @@ def main():
     inp.add_argument("--ac_tsv",     default=None,
                      help="Raw AC data TSV (T, tau_mean/tau_mu, alpha) — "
                           "needed for FK quantile targets")
+    inp.add_argument("--ac_phase2",  default=None,
+                     help="ac_phase2_out.csv — seed the domain MEANS (A,Ueff,"
+                          "R,N,Q) from the window-fitted phase-2 values instead "
+                          "of the degenerate per-row MC medians. Strongly "
+                          "recommended; replaces manual --x0_R/--x0_n/--x0_Q.")
     inp.add_argument("--dc_params",  default=None,
                      help="dc_montecarlo.py output CSV")
     inp.add_argument("--dc_phase2",  default=None,
@@ -712,10 +810,19 @@ def main():
                           "(default 0.0 — maximally non-committal; use -0.9 only "
                           "if you have independent evidence of strong anti-correlation)")
 
+    opt.add_argument("--show_compile", action="store_true",
+                     help="Print the raw windowed (T, param, spread) rows that "
+                          "feed each compiled domain target, so you can see "
+                          "whether the compiled value reflects the bulk of the "
+                          "window or a couple of outliers.")
+
     opt.add_argument("--out",     default="global_combined.csv")
     opt.add_argument("--clear",   action="store_true")
 
     args = ap.parse_args()
+
+    global _VERBOSE_COMPILE
+    _VERBOSE_COMPILE = bool(args.show_compile)
 
     has_ac = args.ac_params is not None
     has_dc = args.dc_params is not None
@@ -743,8 +850,8 @@ def main():
 
     # guard the CLI-supplied fixed correlations (the old pipeline once
     # emitted |rho| > 1, which draw_params silently laundered)
-    args.rho_AU = float(np.clip(args.rho_AU, 0.0, RHO_MAX))
-    args.rho_RN = float(np.clip(args.rho_RN, -RHO_MAX, 0.0))
+    args.rho_AU = float(np.clip(args.rho_AU, -RHO_MAX, 0.0))
+    args.rho_RN = float(np.clip(args.rho_RN, -0.999, 0.999))
 
     # quantile grid must exist before build_rows (targets precomputed there)
     qs = np.array([float(q.strip()) for q in args.qs.split(",")], dtype=float)
@@ -754,6 +861,10 @@ def main():
     df_dc_p  = load_params_csv(args.dc_params, "DC params") if has_dc else None
     df_ac_t  = load_ac_tsv(args.ac_tsv)       if args.ac_tsv    else None
     df_dc_p2 = load_dc_phase2(args.dc_phase2) if args.dc_phase2 else None
+    phase2_means = load_phase2_means(args.ac_phase2) if args.ac_phase2 else None
+    if phase2_means:
+        print("  Seeding domain means from phase-2: "
+              + "  ".join(f"{k}={v:.4g}" for k, v in phase2_means.items()))
 
     # build objective rows (targets precomputed once here)
     rows = build_rows(df_ac_p, df_ac_t, df_dc_p, df_dc_p2, windows, weights, qs)
@@ -772,7 +883,8 @@ def main():
         print("WARNING: no quantile-fit rows — fitting via domain regulariser only.")
 
     # build initials
-    x0, compiled = build_initials(df_ac_p, df_dc_p, orbach_w, raman_w, qtm_w)
+    x0, compiled = build_initials(df_ac_p, df_dc_p, orbach_w, raman_w, qtm_w,
+                                  phase2_means=phase2_means)
     mu0, sig0, _, _ = unpack(x0)
 
     print(f"\n  Compiled domain targets (initial guess):")
@@ -847,9 +959,12 @@ def main():
     # pad res.x back to 12 elements if rho was fixed
     res_x = res.x
     if args.fix_rho:
-        # placeholders only — unpack() below receives the fixed values directly
-        rho_AU_enc = _x_from_rho(max(args.rho_AU,  1e-3))
-        rho_RN_enc = _x_from_rho(max(-args.rho_RN, 1e-3))
+        # placeholders only — unpack() receives the fixed values directly and
+        # applies the sign. Encode the MAGNITUDE of each (both rho_AU, rho_RN
+        # are <= 0, so plain max(rho, 1e-3) would collapse a negative rho_AU to
+        # +1e-3 and lose the sign — use abs()).
+        rho_AU_enc = _x_from_rho(max(abs(args.rho_AU), 1e-3))
+        rho_RN_enc = _x_from_rho(max(abs(args.rho_RN), 1e-3))
         res_x = np.concatenate([res_x, [rho_AU_enc, rho_RN_enc]])
 
     mu, sigmas, rho_AU, rho_RN = unpack(res_x, fixed_rho_AU, fixed_rho_RN)

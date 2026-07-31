@@ -5,6 +5,44 @@ global_fit_combined.py  –  TAURnQ phase 4, combined AC + DC global fit.
 Reads directly from the output CSVs of the updated ac_montecarlo.py and
 dc_montecarlo.py.  No raw TSV or dc_phase2 CSV required.
 
+CORRECTIONS (2026-07-27)
+--------------------------------------
+a. fk_ln_quantiles now uses the EXACT Generalised Debye quantiles (closed
+   form) instead of a normal ppf with the heuristic width 1.82*sqrt(a)/(1-a).
+b. DC targets now use EXACT stretched-exponential quantiles computed from
+   (tau_star, beta) via the one-sided stable distribution whenever those
+   columns are present in the dc_phase2 CSV; the two-piece-normal target is
+   only a fallback.  When the TPN fallback is used, the TPN location passed
+   is mu_ln (the MODE) — the previous code passed e^<ln tau> (the mean),
+   which for a TPN differs from the mode by sqrt(2/pi)(s1 - s2).
+c. Quantile targets are precomputed once in build_rows (they do not depend
+   on the optimisation variables) instead of being rebuilt every objective
+   call — required now that DC targets involve stable-distribution isf.
+d. rho reparametrised: sigmoid map R -> (0, 0.999) with nonzero gradient
+   everywhere, replacing tanh(x)**2 whose gradient vanished at rho = 0 and
+   which saturated near +/-1 (Nelder-Mead parked on the 0.999 plateau).
+   Sign conventions unchanged (rho_AU >= 0, rho_RN <= 0).
+e. CLI-supplied fixed rho values are clipped to the valid range; the old
+   pipeline had emitted |rho| > 1, which draw_params silently laundered
+   through max(1 - rho**2, 1e-12).
+
+CORRECTIONS (2026-07-29)
+--------------------------------------
+f. compile_window: the RN and Q branches now use a robust MEDIAN over the
+   windowed rows, not an inverse-variance-weighted mean — matching what the
+   AU branch already did, and for the same reason. A single temperature
+   cannot separate R from N (or A from Ueff, or resolve Q); those per-row
+   values are unidentified, and their reported per-row spread (Rs/Ns/Qs)
+   reflects optimiser flatness, not physical uncertainty. IVW weights by
+   1/spread**2, so a handful of rows that happened to clamp a parameter to
+   its bound with a spuriously tiny spread dominate the compiled target and
+   drag it to the penalty ceiling (this is what produced N ~= 12, sitting on
+   the qout(N,0,12) bound, with R dragged very negative along the C-n ridge
+   to compensate). The median reports the bulk of the window instead.
+g. --show_compile prints the raw windowed (T, param, spread) rows that feed
+   each compiled target, so you can see whether the compiled value reflects
+   the bulk of the window or a couple of outliers.
+
 KEY CHANGES from the previous version
 --------------------------------------
 1. Single params CSV per experiment type.
@@ -58,7 +96,7 @@ Usage (DC only — no AC):
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from scipy.stats import norm, skew as scipy_skew
+from scipy.stats import norm, levy_stable, skew as scipy_skew
 import argparse, os, sys
 
 SQRT2PI = np.sqrt(2.0 / np.pi)
@@ -69,8 +107,32 @@ SQRT2PI = np.sqrt(2.0 / np.pi)
 # ---------------------------------------------------------------------------
 
 def fk_ln_quantiles(tau_mean, alpha, qs):
-    g = 1.82 * np.sqrt(alpha) / (1.0 - alpha)
-    return np.log(tau_mean) + norm.ppf(qs) * g
+    """Exact Generalised Debye quantiles of ln(tau), from the closed-form CDF
+
+        F(s) = 1/2 + arctan[cot(a*pi/2) tanh((1-a)s/2)] / (pi(1-a)),
+        s(q) = (2/(1-a)) artanh[ tan(a*pi/2) tan(pi(1-a)(q - 1/2)) ].
+
+    Replaces the normal approximation with sigma = 1.82*sqrt(a)/(1-a): the
+    GD distribution has exponential tails, so a normal ppf misses the outer
+    quantiles badly (q = 0.98 at alpha = 0.1: exact 2.05 vs normal 1.31,
+    ln units), and the heuristic sigma matched neither the exact SD nor the
+    exact 68% half-width."""
+    a  = float(alpha)
+    qs = np.asarray(qs, dtype=float)
+    return np.log(tau_mean) + (2.0 / (1.0 - a)) * np.arctanh(
+        np.tan(a * np.pi / 2.0) * np.tan(np.pi * (1.0 - a) * (qs - 0.5)))
+
+
+def sef_ln_quantiles(tau_star, beta, qs):
+    """Exact stretched-exponential quantiles of ln(tau).
+
+    exp[-(t/tau*)^beta] = E[exp(-t·S/tau*)] with S one-sided stable(beta),
+    so s = tau*/tau ~ S and, since s is decreasing in tau,
+        P(ln tau <= x) = SF_S(s)  =>  ln tau_q = ln tau* - ln isf(q)."""
+    dist = levy_stable(float(beta), 1.0, loc=0.0,
+                       scale=np.cos(np.pi * float(beta) / 2.0) ** (1.0 / float(beta)))
+    qs = np.asarray(qs, dtype=float)
+    return np.log(tau_star) - np.log(dist.isf(qs))
 
 
 def tpn_ln_quantiles(mu_ln, s1, s2, qs):
@@ -116,17 +178,46 @@ def mc_quantiles(T, mu, sigmas, rho_AU, rho_RN, qs, Z):
     return np.quantile(np.log(1.0 / np.maximum(r, 1e-300)), qs)
 
 
+RHO_MAX = 0.999
+
+
+def _rho_from_x(x):
+    """Monotone map R -> (0, RHO_MAX) with nonzero gradient everywhere.
+
+    Replaces tanh(x)**2, whose gradient vanished at rho = 0 (the optimiser
+    could not move off zero) and which saturated to ~1 by |x| ~ 3 (the
+    optimiser parked on the 0.999 plateau — cf. rho pinned at +/-0.999 in
+    earlier outputs)."""
+    return RHO_MAX / (1.0 + np.exp(-x))
+
+
+def _x_from_rho(rho):
+    """Inverse of _rho_from_x for |rho|.  Encode moderate values only —
+    encoding rho ~ 0 or ~ RHO_MAX would start the optimiser in a saturated
+    region of the sigmoid."""
+    p = np.clip(abs(float(rho)) / RHO_MAX, 1e-6, 1.0 - 1e-6)
+    return float(np.log(p / (1.0 - p)))
+
+
 def unpack(x, fixed_rho_AU=None, fixed_rho_RN=None):
     mu     = x[0:5]
     sigmas = 1e-3 + np.exp(x[5:10])
-    rho_AU = fixed_rho_AU if fixed_rho_AU is not None else np.tanh(x[10]) ** 2
-    rho_RN = fixed_rho_RN if fixed_rho_RN is not None else -(np.tanh(x[11]) ** 2)
+    # sign conventions retained: rho_AU >= 0 (with tau = 10^A e^{U/T}, a
+    # higher barrier is compensated by a larger prefactor), rho_RN <= 0
+    # (intercept/slope anticorrelation of the Raman power law for T > 1 K)
+    rho_AU = fixed_rho_AU if fixed_rho_AU is not None else _rho_from_x(x[10])
+    rho_RN = fixed_rho_RN if fixed_rho_RN is not None else -_rho_from_x(x[11])
     return mu, sigmas, rho_AU, rho_RN
 
 
 # ---------------------------------------------------------------------------
 # Window / compilation helpers
 # ---------------------------------------------------------------------------
+
+# When True, compile_window prints the raw windowed rows that feed each
+# compiled target (set from main() by --show_compile).
+_VERBOSE_COMPILE = False
+
 
 def parse_window(s):
     if not s or str(s).strip() == "":
@@ -167,9 +258,25 @@ def _sigma_floor(vals, abs_floor=0.02, quantile_floor=0.25):
     return max(abs_floor, float(np.quantile(v, quantile_floor)))
 
 
+def _dump_window(sub, which):
+    """Print the raw windowed rows feeding a compiled target."""
+    cols_by = {"AU": ["T", "Au", "As", "Uu", "Us"],
+               "RN": ["T", "Ru", "Rs", "Nu", "Ns"],
+               "Q":  ["T", "Qu", "Qs"]}
+    cols = [c for c in cols_by[which] if c in sub.columns]
+    if not cols:
+        return
+    print(f"\n  [compile {which}] {len(sub)} row(s) in window:")
+    with pd.option_context("display.float_format", lambda v: f"{v:9.4f}"):
+        print("    " + sub[cols].to_string(index=False).replace("\n", "\n    "))
+
+
 def compile_window(df, mask, which):
     """Compile mean and spread for a parameter group from windowed rows."""
     sub = df[mask].copy()
+
+    if _VERBOSE_COMPILE and not sub.empty:
+        _dump_window(sub, which)
 
     if which == "AU":
         sub = sub.dropna(subset=["Au", "As", "Uu", "Us"])
@@ -190,9 +297,21 @@ def compile_window(df, mask, which):
         sub = sub.dropna(subset=["Ru", "Rs", "Nu", "Ns"])
         if sub.empty:
             return None
+        # Robust median for (R, N), for exactly the same reason as (A, Ueff):
+        # a single temperature only constrains the TOTAL rate there, so it has
+        # no leverage to separate the Raman prefactor R from the exponent N.
+        # The per-row (R, N) are therefore unidentified and Ns reflects
+        # optimiser flatness, not physical spread. An inverse-variance-weighted
+        # mean (weight = 1/Ns**2) lets a couple of rows that clamped N to its
+        # qout() bound with a spuriously tiny Ns bulldoze every well-behaved
+        # row — the mechanism that produced N ~= 12 with R dragged very
+        # negative along the C-n ridge to compensate. The median reports the
+        # bulk of the window. (Independent medians of R and N can land slightly
+        # off the C-n ridge; that is acceptable for a starting point / domain
+        # target — the global quantile loss re-couples them.)
         floor_R = _sigma_floor(sub["Rs"].values)
         floor_N = _sigma_floor(sub["Ns"].values)
-        return ((ivw_mean(sub["Ru"], sub["Rs"]), ivw_mean(sub["Nu"], sub["Ns"])),
+        return ((robust_med(sub["Ru"].values), robust_med(sub["Nu"].values)),
                 (max(robust_med(sub["Rs"].values), floor_R),
                  max(robust_med(sub["Ns"].values), floor_N)))
 
@@ -200,8 +319,11 @@ def compile_window(df, mask, which):
         sub = sub.dropna(subset=["Qu", "Qs"])
         if sub.empty:
             return None
+        # Robust median for Q too — same identifiability argument, and with
+        # often only a handful of QTM-window rows the IVW is especially fragile
+        # (one tight row dominates the whole compiled value).
         floor_Q = _sigma_floor(sub["Qs"].values)
-        return ((ivw_mean(sub["Qu"], sub["Qs"]),),
+        return ((robust_med(sub["Qu"].values),),
                 (max(robust_med(sub["Qs"].values), floor_Q),))
 
 
@@ -250,12 +372,13 @@ def build_initials(df_ac, df_dc, AU_w, RN_w, Q_w):
     rAU = np.clip(safe_corr("Au", "Uu"), 0.0, 0.95)
     rRN = np.clip(-abs(safe_corr("Ru", "Nu")), -0.95, 0.0)
 
+    # start |rho| at >= 0.10 so the sigmoid gradient is healthy at x0
     x0 = np.array([A0, U0, R0, N0, Q0,
                    np.log(max(sA0, 1e-6)), np.log(max(sU0, 1e-6)),
                    np.log(max(sR0, 1e-6)), np.log(max(sN0, 1e-6)),
                    np.log(max(sQ0, 1e-6)),
-                   np.arctanh(np.sqrt(np.clip(rAU, 0, 0.99))),
-                   np.arctanh(np.sqrt(np.clip(abs(rRN), 0, 0.99)))],
+                   _x_from_rho(np.clip(max(rAU, 0.10), 0.10, 0.95)),
+                   _x_from_rho(np.clip(max(abs(rRN), 0.10), 0.10, 0.95))],
                   dtype=float)
 
     compiled = {
@@ -324,10 +447,7 @@ def objective(x, rows, qs, Z, compiled, lam_AU, lam_RN, lam_Q,
         w   = row.get("weight", 1.0)
         lnq = mc_quantiles(T, mu, sigmas, rho_AU, rho_RN, qs, Z)
 
-        if row["target_type"] == "fk":
-            tgt = fk_ln_quantiles(row["fk_tau_mean"], row["fk_alpha"], qs)
-        else:
-            tgt = tpn_ln_quantiles(row["tpn_mu_ln"], row["tpn_s1"], row["tpn_s2"], qs)
+        tgt = row["tgt"]          # precomputed in build_rows
 
         resid  = lnq - tgt
         total += w * float(np.dot(resid, resid))
@@ -395,16 +515,21 @@ def load_ac_tsv(path):
 def load_dc_phase2(path):
     df = pd.read_csv(path)
     _ensure_cols(df, {"T", "mu_ln", "sigma1_ln", "sigma2_ln"}, "dc_phase2")
-    # elnTau_ln is the correct centre: e^<lntau> = geometric mean of the SEF
-    # mu_ln is only the TPN location parameter (mode of left half-Gaussian)
-    # Use elnTau_ln when available, fall back to mu_ln with a warning
-    if "elnTau_ln" in df.columns:
-        df["_centre_ln"] = df["elnTau_ln"]
+    # NOTE: the previous version substituted e^<ln tau> (the mean) for the
+    # TPN location.  The TPN quantile function requires the MODE; for a TPN
+    # mean = mode + sqrt(2/pi)(s2 - s1), so that substitution shifted every
+    # DC target systematically.  With the corrected dc_phase2.py, mu_ln is
+    # the mode of the correct density and is used directly — and if
+    # (tau_star, beta) are present we bypass the TPN entirely and use exact
+    # stretched-exponential quantiles as targets.
+    if {"tau_star", "beta"}.issubset(df.columns):
+        print("  dc_phase2: (tau_star, beta) present — DC targets will use "
+              "EXACT stretched-exponential quantiles.")
     else:
-        print("  WARNING: dc_phase2 file has no elnTau_ln column — "
-              "falling back to mu_ln. Re-run dc_phase2.py to get elnTau_ln.",
+        print("  WARNING: dc_phase2 file lacks tau_star/beta columns — "
+              "falling back to two-piece-normal targets anchored at mu_ln "
+              "(the mode). Re-run the corrected dc_phase2.py for exact targets.",
               file=sys.stderr)
-        df["_centre_ln"] = df["mu_ln"]
     return df.reset_index(drop=True)
 
 
@@ -414,18 +539,23 @@ def load_dc_phase2(path):
 
 def build_rows(df_ac_params, df_ac_tsv,
                df_dc_params, df_dc_phase2,
-               windows, weights):
+               windows, weights, qs):
     """
     Build a flat list of row dicts for the objective function.
 
+    Targets are PRECOMPUTED here (they do not depend on the optimisation
+    variables) and stored per row as "tgt"; the objective just reads them.
+
     For AC rows:
-      - If ac_tsv is provided: use raw (tau_mean, alpha) → FK target
+      - If ac_tsv is provided: exact Generalised Debye quantile targets from
+        raw (tau_mean, alpha)
       - If not: the AC params CSV doesn't store raw tau/alpha, so these rows
         contribute only through the domain regulariser, not the quantile loss.
         A warning is printed.
 
     For DC rows:
-      - dc_phase2 CSV provides (mu_ln, sigma1_ln, sigma2_ln) → TPN target
+      - If dc_phase2 has (tau_star, beta): exact SEF quantile targets
+      - Else: TPN targets anchored at mu_ln (the MODE — never the mean)
       - If dc_phase2 not provided: same caveat as AC above.
 
     Weights are assigned by (experiment_source, window_type):
@@ -452,9 +582,11 @@ def build_rows(df_ac_params, df_ac_tsv,
                 weight = weights.get(f"ac_{wtype}", 1.0)
                 rows.append({
                     "T":           T,
-                    "target_type": "fk",
+                    "target_type": "gd_exact",
                     "fk_tau_mean": float(r["tau_mean"]),
                     "fk_alpha":    float(r["alpha"]),
+                    "tgt":         fk_ln_quantiles(float(r["tau_mean"]),
+                                                   float(r["alpha"]), qs),
                     "weight":      weight,
                     "source":      "ac",
                     "wtype":       wtype,
@@ -468,16 +600,28 @@ def build_rows(df_ac_params, df_ac_tsv,
         else:
             T_dc = set(df_dc_params["T"].values)
             dfp2 = df_dc_phase2[df_dc_phase2["T"].isin(T_dc)].sort_values("T").reset_index(drop=True)
+            dc_exact = {"tau_star", "beta"}.issubset(dfp2.columns)
             for _, r in dfp2.iterrows():
                 T      = float(r["T"])
                 wtype  = _window_type(T, windows, "dc")
                 weight = weights.get(f"dc_{wtype}", 1.0)
+                if dc_exact:
+                    tgt   = sef_ln_quantiles(float(r["tau_star"]),
+                                             float(r["beta"]), qs)
+                    ttype = "sef_exact"
+                else:
+                    # fallback: TPN anchored at the MODE (mu_ln), never the mean
+                    tgt   = tpn_ln_quantiles(float(r["mu_ln"]),
+                                             float(r["sigma1_ln"]),
+                                             float(r["sigma2_ln"]), qs)
+                    ttype = "tpn"
                 rows.append({
                     "T":           T,
-                    "target_type": "tpn",
-                    "tpn_mu_ln":   float(r["_centre_ln"]),
+                    "target_type": ttype,
+                    "tpn_mu_ln":   float(r["mu_ln"]),
                     "tpn_s1":      float(r["sigma1_ln"]),
                     "tpn_s2":      float(r["sigma2_ln"]),
+                    "tgt":         tgt,
                     "weight":      weight,
                     "source":      "dc",
                     "wtype":       wtype,
@@ -621,10 +765,19 @@ def main():
                           "(default 0.0 — maximally non-committal; use -0.9 only "
                           "if you have independent evidence of strong anti-correlation)")
 
+    opt.add_argument("--show_compile", action="store_true",
+                     help="Print the raw windowed (T, param, spread) rows that "
+                          "feed each compiled domain target, so you can see "
+                          "whether the compiled value reflects the bulk of the "
+                          "window or a couple of outliers.")
+
     opt.add_argument("--out",     default="global_combined.csv")
     opt.add_argument("--clear",   action="store_true")
 
     args = ap.parse_args()
+
+    global _VERBOSE_COMPILE
+    _VERBOSE_COMPILE = bool(args.show_compile)
 
     has_ac = args.ac_params is not None
     has_dc = args.dc_params is not None
@@ -650,14 +803,22 @@ def main():
         "dc_other":  1.0,
     }
 
+    # guard the CLI-supplied fixed correlations (the old pipeline once
+    # emitted |rho| > 1, which draw_params silently laundered)
+    args.rho_AU = float(np.clip(args.rho_AU, 0.0, RHO_MAX))
+    args.rho_RN = float(np.clip(args.rho_RN, -RHO_MAX, 0.0))
+
+    # quantile grid must exist before build_rows (targets precomputed there)
+    qs = np.array([float(q.strip()) for q in args.qs.split(",")], dtype=float)
+
     # load params CSVs
     df_ac_p  = load_params_csv(args.ac_params, "AC params") if has_ac else None
     df_dc_p  = load_params_csv(args.dc_params, "DC params") if has_dc else None
     df_ac_t  = load_ac_tsv(args.ac_tsv)       if args.ac_tsv    else None
     df_dc_p2 = load_dc_phase2(args.dc_phase2) if args.dc_phase2 else None
 
-    # build objective rows
-    rows = build_rows(df_ac_p, df_ac_t, df_dc_p, df_dc_p2, windows, weights)
+    # build objective rows (targets precomputed once here)
+    rows = build_rows(df_ac_p, df_ac_t, df_dc_p, df_dc_p2, windows, weights, qs)
 
     # report
     src_wtype = [(r["source"], r["wtype"]) for r in rows]
@@ -726,7 +887,6 @@ def main():
     else:
         print(f"\n  Correlations free (12 parameters)")
 
-    qs = np.array([float(q.strip()) for q in args.qs.split(",")], dtype=float)
     Z  = np.random.default_rng(args.seed).standard_normal((args.K, 5))
 
     def obj(x):
@@ -749,8 +909,9 @@ def main():
     # pad res.x back to 12 elements if rho was fixed
     res_x = res.x
     if args.fix_rho:
-        rho_AU_enc = np.arctanh(np.sqrt(np.clip(args.rho_AU,  0.0,  0.99)))
-        rho_RN_enc = np.arctanh(np.sqrt(np.clip(-args.rho_RN, 0.0,  0.99)))
+        # placeholders only — unpack() below receives the fixed values directly
+        rho_AU_enc = _x_from_rho(max(args.rho_AU,  1e-3))
+        rho_RN_enc = _x_from_rho(max(-args.rho_RN, 1e-3))
         res_x = np.concatenate([res_x, [rho_AU_enc, rho_RN_enc]])
 
     mu, sigmas, rho_AU, rho_RN = unpack(res_x, fixed_rho_AU, fixed_rho_RN)
